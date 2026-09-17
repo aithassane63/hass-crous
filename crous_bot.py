@@ -2,9 +2,9 @@
 """
 CROUS housing monitor -> Telegram alert bot.
 
-Runs as a stateless one-shot job (designed for GitHub Actions cron):
+Runs as a one-shot job with repository-backed state (designed for GitHub Actions):
 
-    load state -> detect tool id -> query CROUS -> diff -> alert -> save state -> exit
+    load state -> sync /start subscribers -> query CROUS -> diff -> alert -> save
 
 Scope: ALERTING ONLY. This bot never books, never logs in, never submits a
 form. It only reads the public search API and notifies you on Telegram.
@@ -21,9 +21,13 @@ import os
 import re
 import sys
 import time
+from base64 import urlsafe_b64encode
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from hashlib import sha256
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 
 # Optional: load a local .env file when running OUTSIDE GitHub Actions.
 # In production the values come from GitHub Secrets (environment variables).
@@ -97,9 +101,11 @@ USER_AGENT = os.getenv(
 )
 
 # --- Telegram ----------------------------------------------------------------
-TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
 TELEGRAM_MAX_RETRIES = int(os.getenv("TELEGRAM_MAX_RETRIES", "5"))
 TELEGRAM_BACKOFF_BASE = float(os.getenv("TELEGRAM_BACKOFF_BASE", "2.0"))
+TELEGRAM_UPDATES_LIMIT = 100
+TELEGRAM_SEND_WORKERS = int(os.getenv("TELEGRAM_SEND_WORKERS", "8"))
 
 # --- Monitoring behaviour ----------------------------------------------------
 FAILURE_THRESHOLD = int(os.getenv("FAILURE_THRESHOLD", "3"))
@@ -107,13 +113,20 @@ HEARTBEAT_INTERVAL_HOURS = int(os.getenv("HEARTBEAT_INTERVAL_HOURS", "1"))
 
 # --- State file (committed back to the repo by the workflow) -----------------
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 # --- Secrets (NEVER hardcode; provided via environment / GitHub Secrets) -----
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-# Support several recipients: comma-separated chat ids in TELEGRAM_CHAT_ID.
-TELEGRAM_CHAT_IDS = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
+# Optional one-time migration path for installations that previously configured
+# fixed, comma-separated recipients. New recipients subscribe with /start.
+LEGACY_TELEGRAM_CHAT_IDS = [
+    c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()
+]
+# Optional explicit Fernet key. By default a stable private key is derived from
+# the bot token, which is already a high-entropy GitHub secret. This keeps chat
+# ids unreadable when state.json is committed to a public repository.
+SUBSCRIBER_ENCRYPTION_KEY = os.getenv("SUBSCRIBER_ENCRYPTION_KEY", "").strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -432,35 +445,40 @@ def fetch_all_listings(session, tool_id):
 # --------------------------------------------------------------------------- #
 # TELEGRAM
 # --------------------------------------------------------------------------- #
-def _send_telegram_single(chat_id, text, disable_preview=True):
-    """Send an HTML message to ONE chat, with retries, backoff, retry_after."""
-    api_url = TELEGRAM_API_URL_TEMPLATE.format(token=TELEGRAM_BOT_TOKEN)
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": disable_preview,
-    }
+def _telegram_api_request(method, payload):
+    """Call one Telegram Bot API method with retries and rate-limit handling."""
+    api_url = TELEGRAM_API_URL_TEMPLATE.format(
+        token=TELEGRAM_BOT_TOKEN, method=method
+    )
 
     for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
         try:
             resp = requests.post(api_url, json=payload, timeout=HTTP_TIMEOUT)
         except requests.RequestException as exc:
+            error_name = type(exc).__name__
             if attempt == TELEGRAM_MAX_RETRIES:
-                raise RuntimeError("Telegram network error: %s" % exc) from exc
+                raise RuntimeError(
+                    "Telegram network error (%s)" % error_name
+                ) from None
             delay = TELEGRAM_BACKOFF_BASE ** attempt
             log.warning(
-                "Telegram network error (attempt %d/%d): %s -> retry in %.1fs",
+                "Telegram network error (attempt %d/%d, %s) -> retry in %.1fs",
                 attempt,
                 TELEGRAM_MAX_RETRIES,
-                exc,
+                error_name,
                 delay,
             )
             time.sleep(delay)
             continue
 
         if resp.status_code == 200:
-            return True
+            try:
+                body = resp.json()
+            except ValueError as exc:
+                raise RuntimeError("Telegram returned a non-JSON response") from exc
+            if not isinstance(body, dict) or not body.get("ok"):
+                raise RuntimeError("Telegram API returned an invalid response")
+            return body.get("result")
 
         if resp.status_code == 429:
             retry_after = TELEGRAM_BACKOFF_BASE ** attempt
@@ -484,39 +502,81 @@ def _send_telegram_single(chat_id, text, disable_preview=True):
             time.sleep(delay)
             continue
 
-        # Any other 4xx is unrecoverable (bad token, bad chat id, bad HTML...).
+        # Any other 4xx is unrecoverable (bad token, webhook conflict, bad
+        # chat id, bad HTML...). Do not include the token-bearing URL in logs.
         raise RuntimeError(
-            "Telegram API error %d: %s" % (resp.status_code, resp.text)
+            "Telegram API %s error %d: %s"
+            % (method, resp.status_code, resp.text)
         )
 
-    raise RuntimeError("Telegram send failed after all retries.")
+    raise RuntimeError("Telegram %s failed after all retries." % method)
 
 
-def send_telegram(text, disable_preview=True):
-    """Send an HTML message to every configured recipient.
+def _send_telegram_single(chat_id, text, disable_preview=True):
+    """Send an HTML message to ONE chat, with retries, backoff, retry_after."""
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_preview,
+    }
+    _telegram_api_request("sendMessage", payload)
+    return True
+
+
+def send_telegram(text, chat_ids, disable_preview=True):
+    """Send an HTML message to every subscribed recipient.
 
     Each recipient is delivered independently: if one chat id fails (e.g. a
     friend who never pressed Start on the bot), the others still receive the
     message. Raises only if EVERY recipient failed.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
-        raise RuntimeError("Telegram credentials are missing.")
+    recipients = sorted({str(chat_id) for chat_id in chat_ids})
+    if not recipients:
+        log.info("No Telegram subscribers; message skipped.")
+        return 0
 
-    errors = []
     sent = 0
-    for chat_id in TELEGRAM_CHAT_IDS:
-        try:
-            _send_telegram_single(chat_id, text, disable_preview=disable_preview)
-            sent += 1
-        except Exception as exc:
-            log.error("Telegram send to %s failed: %s", chat_id, exc)
-            errors.append((chat_id, exc))
+    worker_count = max(1, min(TELEGRAM_SEND_WORKERS, len(recipients)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(
+                _send_telegram_single,
+                chat_id,
+                text,
+                disable_preview=disable_preview,
+            )
+            for chat_id in recipients
+        ]
+        for future in as_completed(futures):
+            try:
+                future.result()
+                sent += 1
+            except Exception as exc:
+                # Avoid printing personal chat ids in public GitHub Actions logs.
+                log.error("Telegram send to one subscriber failed: %s", exc)
 
     if sent == 0:
         raise RuntimeError(
-            "Telegram send failed for all %d recipient(s)." % len(TELEGRAM_CHAT_IDS)
+            "Telegram send failed for all %d subscriber(s)." % len(recipients)
         )
-    return True
+    log.info("Telegram message delivered to %d/%d subscriber(s).", sent, len(recipients))
+    return sent
+
+
+def fetch_telegram_updates(offset=None):
+    """Fetch up to one Bot API batch of private/group messages."""
+    payload = {
+        "limit": TELEGRAM_UPDATES_LIMIT,
+        "timeout": 0,
+        "allowed_updates": ["message"],
+    }
+    if isinstance(offset, int):
+        payload["offset"] = offset
+    updates = _telegram_api_request("getUpdates", payload)
+    if not isinstance(updates, list):
+        raise RuntimeError("Telegram getUpdates returned an invalid result")
+    return updates
 
 
 def format_listing_message(listing, restock=False):
@@ -550,6 +610,54 @@ def format_listing_message(listing, restock=False):
 # --------------------------------------------------------------------------- #
 # STATE MANAGEMENT
 # --------------------------------------------------------------------------- #
+def _subscriber_cipher():
+    """Return the cipher used to keep subscriber chat ids out of public state."""
+    if SUBSCRIBER_ENCRYPTION_KEY:
+        key = SUBSCRIBER_ENCRYPTION_KEY.encode("ascii")
+    else:
+        # Domain separation prevents this derived key from being confused with
+        # any other value derived from the same bot token.
+        digest = sha256(
+            b"crous-bot/subscribers/v1\0" + TELEGRAM_BOT_TOKEN.encode("utf-8")
+        ).digest()
+        key = urlsafe_b64encode(digest)
+    try:
+        return Fernet(key)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "SUBSCRIBER_ENCRYPTION_KEY must be a valid Fernet key"
+        ) from exc
+
+
+def load_subscribers(state):
+    """Decrypt and validate the persisted Telegram subscriber registry."""
+    encrypted = state.get("subscribers_encrypted")
+    if not encrypted:
+        return set()
+    try:
+        raw = _subscriber_cipher().decrypt(str(encrypted).encode("ascii"))
+        decoded = json.loads(raw.decode("utf-8"))
+    except (InvalidToken, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Cannot decrypt subscriber registry. If the bot token changed, "
+            "restore the old token/key or clear subscribers_encrypted."
+        ) from exc
+    if not isinstance(decoded, list) or not all(
+        isinstance(chat_id, str) and chat_id for chat_id in decoded
+    ):
+        raise RuntimeError("Decrypted subscriber registry has an invalid format")
+    return set(decoded)
+
+
+def save_subscribers(state, subscribers):
+    """Encrypt a normalized subscriber list into the persistent state."""
+    normalized = sorted({str(chat_id) for chat_id in subscribers})
+    plaintext = json.dumps(normalized, separators=(",", ":")).encode("utf-8")
+    state["subscribers_encrypted"] = (
+        _subscriber_cipher().encrypt(plaintext).decode("ascii")
+    )
+
+
 def default_state():
     return {
         "version": STATE_VERSION,
@@ -558,6 +666,9 @@ def default_state():
         "consecutive_failures": 0,
         "failure_alert_sent": False,
         "last_heartbeat": None,
+        "subscribers_encrypted": None,
+        "telegram_update_offset": None,
+        "legacy_chat_ids_migrated": False,
     }
 
 
@@ -572,8 +683,13 @@ def load_state():
         for key in base:
             if key in loaded:
                 base[key] = loaded[key]
+        # Loading an older schema performs an in-memory migration. The next
+        # normal save persists the current version and new default fields.
+        base["version"] = STATE_VERSION
         if not isinstance(base.get("listings"), dict):
             base["listings"] = {}
+        if not isinstance(base.get("telegram_update_offset"), (int, type(None))):
+            base["telegram_update_offset"] = None
         return base
     except Exception as exc:
         log.error("State file unreadable (%s). Recreating fresh state.", exc)
@@ -592,6 +708,100 @@ def save_state(state):
         len(state.get("listings", {})),
         state.get("consecutive_failures", 0),
     )
+
+
+# --------------------------------------------------------------------------- #
+# TELEGRAM SUBSCRIPTIONS
+# --------------------------------------------------------------------------- #
+def _telegram_command(message):
+    """Return a normalized /command from a Telegram message, or None."""
+    if not isinstance(message, dict):
+        return None
+    text = message.get("text")
+    if not isinstance(text, str) or not text.startswith("/"):
+        return None
+    first_word = text.strip().split(maxsplit=1)[0].lower()
+    # In groups Telegram commands can be addressed as /start@bot_username.
+    return first_word.split("@", 1)[0]
+
+
+def sync_telegram_subscribers(state, subscribers):
+    """Apply /start and /stop updates and return the current subscriber set."""
+    subscribers = set(subscribers)
+    registry_changed = False
+
+    # Preserve recipients from the old fixed-chat configuration exactly once.
+    # After migration they can unsubscribe with /stop without being re-added.
+    if not state.get("legacy_chat_ids_migrated", False):
+        before = len(subscribers)
+        subscribers.update(LEGACY_TELEGRAM_CHAT_IDS)
+        registry_changed = len(subscribers) != before
+        state["legacy_chat_ids_migrated"] = True
+        log.info(
+            "Migrated %d legacy Telegram recipient(s).",
+            len(LEGACY_TELEGRAM_CHAT_IDS),
+        )
+
+    updates = fetch_telegram_updates(state.get("telegram_update_offset"))
+    max_update_id = None
+
+    for update in updates:
+        if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+            continue
+        update_id = update["update_id"]
+        max_update_id = update_id if max_update_id is None else max(max_update_id, update_id)
+
+        message = update.get("message")
+        command = _telegram_command(message)
+        chat = message.get("chat") if isinstance(message, dict) else None
+        chat_id = chat.get("id") if isinstance(chat, dict) else None
+        if chat_id is None or command not in ("/start", "/stop"):
+            continue
+        chat_id = str(chat_id)
+
+        if command == "/start":
+            was_new = chat_id not in subscribers
+            subscribers.add(chat_id)
+            registry_changed = registry_changed or was_new
+            status = "activé" if was_new else "déjà actif"
+            confirmation = (
+                "✅ <b>Abonnement CROUS %s</b>\n\n"
+                "Vous recevrez les alertes de nouveaux logements, les "
+                "réapprovisionnements et les messages d'état du bot.\n"
+                "📦 %d logement(s) suivi(s) actuellement.\n\n"
+                "Envoyez /stop pour vous désabonner."
+                % (status, len(state.get("listings", {})))
+            )
+        else:
+            was_subscribed = chat_id in subscribers
+            subscribers.discard(chat_id)
+            registry_changed = registry_changed or was_subscribed
+            confirmation = (
+                "🛑 <b>Abonnement CROUS arrêté</b>\n\n"
+                "Vous ne recevrez plus les alertes. Envoyez /start pour vous "
+                "réabonner."
+            )
+
+        # A reply is best-effort. The registry and update offset are still
+        # persisted so one unreachable user cannot block every other subscriber.
+        try:
+            _send_telegram_single(chat_id, confirmation)
+        except Exception as exc:
+            log.warning("Could not acknowledge a subscription command: %s", exc)
+
+    if max_update_id is not None:
+        state["telegram_update_offset"] = max_update_id + 1
+    if registry_changed or state.get("subscribers_encrypted") is None:
+        save_subscribers(state, subscribers)
+
+    if len(updates) == TELEGRAM_UPDATES_LIMIT:
+        log.info("Telegram update backlog remains; the next run will continue it.")
+    log.info(
+        "Processed %d Telegram update(s); %d active subscriber(s).",
+        len(updates),
+        len(subscribers),
+    )
+    return subscribers
 
 
 # --------------------------------------------------------------------------- #
@@ -639,7 +849,7 @@ def should_send_heartbeat(state, now):
 # --------------------------------------------------------------------------- #
 # MONITORING CYCLE
 # --------------------------------------------------------------------------- #
-def run_monitor_cycle(state, session, now):
+def run_monitor_cycle(state, session, now, subscribers):
     """Perform one full monitoring cycle. Raises on failure."""
     tool_id = resolve_tool_id(session)
     listings = fetch_all_listings(session, tool_id)
@@ -659,7 +869,8 @@ def run_monitor_cycle(state, session, now):
             "(%d suivi(s) au total).\n\n"
             "Vous recevrez une alerte d\u00e8s qu'un nouveau logement appara\u00eet "
             "ou qu'un logement est r\u00e9approvisionn\u00e9."
-            % (available_count, len(listings))
+            % (available_count, len(listings)),
+            subscribers,
         )
         log.info(
             "First run: recorded %d listings (%d available) silently.",
@@ -672,9 +883,13 @@ def run_monitor_cycle(state, session, now):
     log.info("Diff: %d new, %d restocked.", len(new_ids), len(restocked))
 
     for acc_id in new_ids:
-        send_telegram(format_listing_message(listings[acc_id], restock=False))
+        send_telegram(
+            format_listing_message(listings[acc_id], restock=False), subscribers
+        )
     for acc_id in restocked:
-        send_telegram(format_listing_message(listings[acc_id], restock=True))
+        send_telegram(
+            format_listing_message(listings[acc_id], restock=True), subscribers
+        )
 
     # Only replace the persisted listings AFTER alerts were sent successfully.
     state["listings"] = listings
@@ -685,10 +900,11 @@ def run_monitor_cycle(state, session, now):
 # MAIN
 # --------------------------------------------------------------------------- #
 def main():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+    cycle_started = time.monotonic()
+    if not TELEGRAM_BOT_TOKEN:
         log.error(
-            "Missing TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID. "
-            "Set them as GitHub Actions secrets. Aborting."
+            "Missing TELEGRAM_BOT_TOKEN. Set it as a GitHub Actions secret. "
+            "Aborting."
         )
         return 1
 
@@ -696,16 +912,20 @@ def main():
     state = load_state()
     session = build_session()
     was_in_failure = bool(state.get("failure_alert_sent", False))
+    subscribers = set()
 
     try:
-        listings = run_monitor_cycle(state, session, now)
+        subscribers = load_subscribers(state)
+        subscribers = sync_telegram_subscribers(state, subscribers)
+        listings = run_monitor_cycle(state, session, now, subscribers)
 
         # Recovery notification (only if a failure alert had been sent before).
         if was_in_failure:
             try:
                 send_telegram(
                     "\u2705 <b>R\u00e9tablissement</b>\n\n"
-                    "Le bot CROUS refonctionne normalement apr\u00e8s une panne."
+                    "Le bot CROUS refonctionne normalement apr\u00e8s une panne.",
+                    subscribers,
                 )
             except Exception as exc:
                 log.warning("Could not send recovery message: %s", exc)
@@ -713,7 +933,7 @@ def main():
         state["consecutive_failures"] = 0
         state["failure_alert_sent"] = False
 
-        # Daily heartbeat.
+        # Periodic heartbeat.
         if should_send_heartbeat(state, now):
             available_count = sum(
                 1 for item in listings.values() if item.get("available", True)
@@ -728,14 +948,18 @@ def main():
                         available_count,
                         len(listings),
                         now.strftime("%d/%m/%Y %H:%M UTC"),
-                    )
+                    ),
+                    subscribers,
                 )
                 state["last_heartbeat"] = now.isoformat()
             except Exception as exc:
                 log.warning("Could not send heartbeat: %s", exc)
 
         save_state(state)
-        log.info("Cycle completed successfully.")
+        log.info(
+            "Cycle completed successfully in %.2f seconds.",
+            time.monotonic() - cycle_started,
+        )
         return 0
 
     except Exception as exc:
@@ -753,7 +977,8 @@ def main():
                     "%d \u00e9checs cons\u00e9cutifs.\n"
                     "Le bot n'arrive plus \u00e0 interroger CROUS.\n"
                     "V\u00e9rifiez les logs GitHub Actions."
-                    % state["consecutive_failures"]
+                    % state["consecutive_failures"],
+                    subscribers,
                 )
                 state["failure_alert_sent"] = True
             except Exception as send_exc:
@@ -761,6 +986,10 @@ def main():
 
         # Listings are left untouched -> saved state is never corrupted.
         save_state(state)
+        log.info(
+            "Failed cycle handled in %.2f seconds.",
+            time.monotonic() - cycle_started,
+        )
         # Exit 0: the failure is handled AND reported via Telegram. Keeping the
         # Actions run green avoids GitHub failure-notification noise; the real
         # signal is the Telegram warning after FAILURE_THRESHOLD failures.
