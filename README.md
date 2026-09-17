@@ -53,8 +53,8 @@ VPS, aucune VM, aucun Oracle Cloud, aucun Docker, aucun hébergement payant.
 - **Surveillance des pannes** : après 3 échecs consécutifs, une alerte est
   envoyée (une seule fois), puis un message de **rétablissement** après le retour
   à la normale.
-- **Battement de cœur quotidien** (heartbeat) indiquant que le bot est vivant et
-  le nombre de logements suivis.
+- **Battement de cœur toutes les 8 heures** (heartbeat) indiquant que le bot est
+  vivant et le nombre de logements suivis.
 - **Fiabilité Telegram** : ré-essais, backoff exponentiel, respect du `retry_after`.
 - **État jamais corrompu** : toute exception est capturée et l'état sauvegardé
   reste cohérent.

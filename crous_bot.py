@@ -109,7 +109,7 @@ TELEGRAM_SEND_WORKERS = int(os.getenv("TELEGRAM_SEND_WORKERS", "8"))
 
 # --- Monitoring behaviour ----------------------------------------------------
 FAILURE_THRESHOLD = int(os.getenv("FAILURE_THRESHOLD", "3"))
-HEARTBEAT_INTERVAL_HOURS = int(os.getenv("HEARTBEAT_INTERVAL_HOURS", "1"))
+HEARTBEAT_INTERVAL_HOURS = int(os.getenv("HEARTBEAT_INTERVAL_HOURS", "8"))
 
 # --- State file (committed back to the repo by the workflow) -----------------
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
