@@ -63,18 +63,21 @@ VPS, aucune VM, aucun Oracle Cloud, aucun Docker, aucun hébergement payant.
 
 ## ⚙️ Comment ça marche
 
-À chaque exécution planifiée, GitHub Actions :
+À chaque exécution planifiée, GitHub Actions lance **10 cycles espacés de 30
+secondes**. À chaque cycle, le bot :
 
 1. charge l'état précédent (`state.json`) ;
 2. lit les nouvelles commandes Telegram (`/start` et `/stop`) ;
 3. interroge l'API publique de recherche CROUS sur la zone Île-de-France ;
 4. compare avec l'état précédent (nouveaux logements + réapprovisionnements) ;
 5. envoie les alertes à tous les abonnés ;
-6. sauvegarde le nouvel état et le **committe** dans le dépôt ;
-7. se termine proprement.
+6. sauvegarde le nouvel état localement.
 
-Il n'y a **aucun serveur permanent**. Chaque exécution est une petite tâche
-indépendante qui démarre, travaille quelques secondes, puis s'arrête.
+À la fin des 10 cycles, le workflow **committe** une seule fois l'état final
+dans le dépôt, puis se termine proprement.
+
+Il n'y a **aucun serveur permanent**. Chaque exécution GitHub Actions surveille
+pendant environ 4 minutes 30, puis l'exécution planifiée suivante prend le relais.
 
 ---
 
@@ -217,14 +220,16 @@ Avant d'attendre la planification, testez tout de suite :
 
 ## ⏱️ Fréquence de surveillance (planification cron)
 
-La planification est définie dans `.github/workflows/crous-monitor.yml`, ligne
-`cron`. Par défaut :
+Le bot interroge CROUS environ toutes les **30 secondes** pendant une exécution.
+La planification définie dans `.github/workflows/crous-monitor.yml` relance cette
+série de 10 contrôles toutes les 5 minutes :
 
 ```yaml
 - cron: "2-59/5 * * * *"   # toutes les 5 minutes (heure UTC)
 ```
 
-Pour changer la fréquence, modifiez cette ligne, par exemple :
+Pour changer la fréquence de lancement des séries, modifiez cette ligne, par
+exemple :
 
 | Fréquence            | Valeur cron        |
 |----------------------|--------------------|
@@ -235,17 +240,18 @@ Pour changer la fréquence, modifiez cette ligne, par exemple :
 
 Remarques importantes :
 
-- L'intervalle **minimum** autorisé par GitHub est de **5 minutes**.
+- L'intervalle cron **minimum** autorisé par GitHub est de **5 minutes**. Les
+  contrôles à 30 secondes sont réalisés à l'intérieur de chaque exécution.
 - Les heures cron sont en **UTC** (l'heure de Paris est UTC+1 en hiver, UTC+2 en été).
 - Les exécutions planifiées peuvent parfois être **légèrement retardées** quand
   la plateforme GitHub est très sollicitée. C'est normal et gratuit.
 
 ### Le bot tourne-t-il en continu (24h/24) ?
 
-Oui, **de fait**. Il n'y a pas de programme qui « reste allumé » : à la place,
-GitHub relance automatiquement une petite exécution toutes les 5 minutes (ou
-selon votre `cron`). Mises bout à bout, ces exécutions assurent une surveillance
-continue, sans serveur, sans rien à maintenir.
+Oui, **de fait**. GitHub relance automatiquement une exécution toutes les 5
+minutes (ou selon votre `cron`) et chaque exécution effectue 10 contrôles. Mises
+bout à bout, elles assurent une surveillance quasi continue sans serveur à
+maintenir.
 
 Deux points à comprendre :
 
@@ -255,9 +261,9 @@ Deux points à comprendre :
   dizaines de minutes** à démarrer. Patientez, puis vérifiez l'onglet **Actions** :
   les exécutions automatiques y apparaissent avec le déclencheur **« Scheduled »**.
 
-Ce n'est pas du temps réel à la seconde (le minimum est de 5 minutes et il peut y
-avoir de légers retards), mais c'est la meilleure surveillance possible en
-**100 % gratuit**.
+Les contrôles d'une exécution sont espacés d'environ 30 secondes. Un court écart
+peut toutefois survenir entre deux exécutions, et GitHub peut retarder le début
+d'un workflow planifié lorsque sa plateforme est chargée.
 
 ---
 
@@ -297,9 +303,9 @@ Toutes les alertes générales sont diffusées à **chaque conversation abonnée
 
 - **Dépôt public = minutes GitHub Actions gratuites et illimitées.** C'est
   l'option recommandée pour une surveillance fréquente et continue.
-- **Dépôt privé = 2000 minutes gratuites par mois.** Chaque exécution dure ~1
-  minute facturée. À raison d'une exécution toutes les 5 minutes, on dépasse
-  largement ce quota.
+- **Dépôt privé = 2000 minutes gratuites par mois.** Chaque exécution dure
+  environ 5 minutes facturées. À raison d'une exécution toutes les 5 minutes,
+  ce mode épuise très rapidement ce quota.
   Sur un dépôt privé, augmentez donc l'intervalle (par ex. `"*/45 * * * *"` ou
   `"0 * * * *"`) pour rester dans les 2000 minutes, **ou** passez le dépôt en
   public.
@@ -399,8 +405,8 @@ Pour maximiser vos chances :
   réagir en quelques secondes.
 - Gardez le **lien de la page de recherche** en favori et vos informations
   (RIB, garant, documents) prêtes.
-- Pendant les gros pics, conservez l'intervalle par défaut de 5 minutes sur un
-  dépôt public pour être alerté le plus tôt possible avec GitHub Actions.
+- Pendant les gros pics, conservez les 10 contrôles espacés de 30 secondes et
+  l'intervalle cron par défaut de 5 minutes sur un dépôt public.
 - La réservation reste **manuelle et rapide** : l'alerte vous fait juste gagner
   les précieuses minutes d'avance.
 
@@ -411,6 +417,6 @@ Pour maximiser vos chances :
 Ce bot se contente de **consulter des informations publiques** et de vous
 **notifier**. Il ne réserve pas, ne se connecte pas, ne remplit aucun formulaire
 et n'automatise aucune action sur le site CROUS. Utilisez-le de façon raisonnable
-(la fréquence par défaut est volontairement modérée) et dans le respect des
-conditions d'utilisation du site CROUS. Toute réservation se fait manuellement, par
-vous, sur le site officiel.
+(un contrôle toutes les 30 secondes par défaut) et dans le respect des conditions
+d'utilisation du site CROUS. Toute réservation se fait manuellement, par vous,
+sur le site officiel.
