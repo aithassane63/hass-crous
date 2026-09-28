@@ -5,17 +5,6 @@
   "last_heartbeat": "2026-09-28T09:35:00.559910+00:00",
   "legacy_chat_ids_migrated": true,
   "listings": {
-    "2702": {
-      "address": "16, rue André Blanc Lapierre 91190 GIF-SUR-YVETTE",
-      "area": null,
-      "available": true,
-      "id": "2702",
-      "label": "T4 Colocation",
-      "rent": "7000",
-      "residence": "Saclay-George Sand",
-      "units": 1,
-      "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/2702"
-    },
     "2856": {
       "address": "2 rue Sophie Germain 91400 Orsay",
       "area": null,
@@ -38,16 +27,16 @@
       "units": 1,
       "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/2862"
     },
-    "678": {
-      "address": "4, place Pierre Mendes France 78990 ELANCOURT",
+    "3004": {
+      "address": "Bâtiment 470 Domaine de l’université de Paris Saclay Rue du château 91400 Orsay",
       "area": null,
       "available": true,
-      "id": "678",
-      "label": "T1 PROV",
+      "id": "3004",
+      "label": "T1",
       "rent": "7000",
-      "residence": "VSQ-Le Capitole",
+      "residence": "Orsay-Georges Charpak",
       "units": 1,
-      "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/678"
+      "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/3004"
     },
     "950": {
       "address": "6, rue du Père Wresinski 28000 CHARTRES",
