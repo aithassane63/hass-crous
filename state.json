@@ -5,6 +5,17 @@
   "last_heartbeat": "2026-10-05T01:37:57.345838+00:00",
   "legacy_chat_ids_migrated": true,
   "listings": {
+    "1571": {
+      "address": "25/27 rue des Bas-Bourgs 28000 CHARTRES",
+      "area": null,
+      "available": true,
+      "id": "1571",
+      "label": "STUDIO 19m2",
+      "rent": "7000",
+      "residence": "JEAN ZAY",
+      "units": 1,
+      "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/1571"
+    },
     "2555": {
       "address": "21, rue André Maginot 91400 ORSAY",
       "area": null,
@@ -27,16 +38,16 @@
       "units": 1,
       "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/2862"
     },
-    "678": {
-      "address": "4, place Pierre Mendes France 78990 ELANCOURT",
+    "950": {
+      "address": "6, rue du Père Wresinski 28000 CHARTRES",
       "area": null,
       "available": true,
-      "id": "678",
-      "label": "T1 PROV",
+      "id": "950",
+      "label": "T1 18m2",
       "rent": "7000",
-      "residence": "VSQ-Le Capitole",
+      "residence": "DESANTI",
       "units": 1,
-      "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/678"
+      "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/950"
     }
   },
   "subscribers_encrypted": "gAAAAABqrEhfeZAOCw_zFiVZgSNTvK-jmCd3fZyyDxBBUQNqfpw70x6eAxjr5sZqkMDBNMYhXkKZwV8Xb7e-OmnXO4k8c8xqPRTzoNgP3HcjXGfp6gNzehxzCKQTIjoRIZsIWQnPKPfXpQVhdli8SkzsIfXk5uVSrg==",
