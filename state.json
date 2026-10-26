@@ -1,10 +1,32 @@
 {
-  "consecutive_failures": 25999,
-  "failure_alert_sent": true,
+  "consecutive_failures": 0,
+  "failure_alert_sent": false,
   "initialized": true,
-  "last_heartbeat": "2026-10-21T09:43:58.656473+00:00",
+  "last_heartbeat": "2026-10-26T09:35:29.277182+00:00",
   "legacy_chat_ids_migrated": true,
   "listings": {
+    "1066": {
+      "address": "QUARTIER ST SYLVERE 95014 CERGY PONTOISE CEDEX",
+      "area": null,
+      "available": true,
+      "id": "1066",
+      "label": "T1 Colocation",
+      "rent": "7000",
+      "residence": "Cergy-Les Chateaux",
+      "units": 1,
+      "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/1066"
+    },
+    "1571": {
+      "address": "25/27 rue des Bas-Bourgs 28000 CHARTRES",
+      "area": null,
+      "available": true,
+      "id": "1571",
+      "label": "STUDIO 19m2",
+      "rent": "7000",
+      "residence": "JEAN ZAY",
+      "units": 1,
+      "url": "https://trouverunlogement.lescrous.fr/tools/47/accommodations/1571"
+    },
     "1714": {
       "address": "8, place François Rabelais 28000 CHARTRES",
       "area": null,
